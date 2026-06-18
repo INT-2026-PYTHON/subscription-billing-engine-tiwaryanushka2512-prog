@@ -51,6 +51,76 @@ from billing_engine.models import (
     Invoice, InvoiceStatus, InvoiceLineItem, LineItemKind,
     LedgerEntry, LedgerDirection,
 )
+def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    return date.fromisoformat(value) if value else None
+
+
+def _customer_from_row(row) -> Customer:
+    return Customer(
+        id=row["id"],
+        name=row["name"],
+        email=row["email"],
+        country_code=row["country_code"],
+        state_code=row["state_code"],
+        created_at=_parse_datetime(row["created_at"]),
+    )
+
+
+def _plan_from_row(row) -> Plan:
+    return Plan(
+        id=row["id"],
+        name=row["name"],
+        pricing_type=PricingType(row["pricing_type"]),
+        billing_period=BillingPeriod(row["billing_period"]),
+        currency=row["currency"],
+        config_json=row["config_json"],
+    )
+
+
+def _subscription_from_row(row) -> Subscription:
+    return Subscription(
+        id=row["id"],
+        customer_id=row["customer_id"],
+        plan_id=row["plan_id"],
+        status=SubscriptionStatus(row["status"]),
+        current_period_start=date.fromisoformat(row["current_period_start"]),
+        current_period_end=date.fromisoformat(row["current_period_end"]),
+        trial_end=_parse_date(row["trial_end"]),
+        discount_id=row["discount_id"],
+        past_due_since=_parse_date(row["past_due_since"]),
+    )
+
+
+def _invoice_from_row(row) -> Invoice:
+    currency = row["currency"]
+    return Invoice(
+        id=row["id"],
+        subscription_id=row["subscription_id"],
+        period_start=date.fromisoformat(row["period_start"]),
+        period_end=date.fromisoformat(row["period_end"]),
+        subtotal=Money(row["subtotal"], currency),
+        discount_total=Money(row["discount_total"], currency),
+        tax_total=Money(row["tax_total"], currency),
+        total=Money(row["total"], currency),
+        status=InvoiceStatus(row["status"]),
+        issued_at=_parse_datetime(row["issued_at"]),
+        pdf_path=row["pdf_path"],
+    )
+
+
+def _line_item_from_row(row, currency: str) -> InvoiceLineItem:
+    return InvoiceLineItem(
+        id=row["id"],
+        invoice_id=row["invoice_id"],
+        description=row["description"],
+        amount=Money(row["amount"], currency),
+        kind=LineItemKind(row["kind"]),
+    )
+
 
 
 # ============================================================
@@ -287,7 +357,13 @@ class SubscriptionRepository:
     def update_period(self, subscription_id: int, new_start: date, new_end: date) -> None:
         # TODO Day 3.
         # Hint: q.update_subscription_period(...)
-        raise NotImplementedError("Day 3: implement SubscriptionRepository.update_period")
+        with self.db.transaction() as conn:
+            q.update_subscription_period(
+                conn,
+                subscription_id,
+                new_start.isoformat(),
+                new_end.isoformat(),
+            )
 
     def update_status(
         self,
@@ -297,7 +373,13 @@ class SubscriptionRepository:
     ) -> None:
         # TODO Day 3.
         # Hint: q.update_subscription_status(...)
-        raise NotImplementedError("Day 3: implement SubscriptionRepository.update_status")
+        with self.db.transaction() as conn:
+            q.update_subscription_status(
+                conn,
+                subscription_id,
+                new_status.value,
+                past_due_since.isoformat() if past_due_since else None,
+            )
 
     def update_plan(self, subscription_id: int, new_plan_id: int) -> None:
         # TODO Day 4.
@@ -394,7 +476,8 @@ class InvoiceRepository:
     def count_for_subscription(self, subscription_id: int) -> int:
         # TODO Day 3.
         # Hint: q.count_invoices_for_subscription(...)
-        raise NotImplementedError("Day 3: implement InvoiceRepository.count_for_subscription")
+              with self.db.connect() as conn:
+               return q.count_invoices_for_subscription(conn, subscription_id)
 
     def mark_paid(self, invoice_id: int) -> None:
         # TODO Day 4.
@@ -476,12 +559,43 @@ class LedgerRepository:
     def add(self, entry: LedgerEntry) -> LedgerEntry:
         # TODO Day 3.
         # Hint: q.insert_ledger_entry(...)
-        raise NotImplementedError("Day 3: implement LedgerRepository.add")
+        with self.db.transaction() as conn:
+            new_id = q.insert_ledger_entry(
+                conn,
+                entry.invoice_id,
+                entry.customer_id,
+                entry.amount.to_storage(),
+                entry.amount.currency,
+                entry.direction.value,
+                entry.reason,
+            )
+        return LedgerEntry(
+            id=new_id,
+            invoice_id=entry.invoice_id,
+            customer_id=entry.customer_id,
+            amount=entry.amount,
+            direction=entry.direction,
+            reason=entry.reason,
+            created_at=entry.created_at,
+        )
 
     def list_for_customer(self, customer_id: int) -> list[LedgerEntry]:
         # TODO Day 3.
         # Hint: q.select_ledger_for_customer(...)
-        raise NotImplementedError("Day 3: implement LedgerRepository.list_for_customer")
+        with self.db.connect() as conn:
+            rows = q.select_ledger_for_customer(conn, customer_id)
+        return [
+            LedgerEntry(
+                id=row["id"],
+                invoice_id=row["invoice_id"],
+                customer_id=row["customer_id"],
+                amount=Money(row["amount"], row["currency"]),
+                direction=LedgerDirection(row["direction"]),
+                reason=row["reason"],
+                created_at=_parse_datetime(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     # These two methods are intentionally implemented to REJECT — do not override.
     def update(self, *args, **kwargs):
@@ -515,14 +629,26 @@ class PaymentAttemptRepository:
     ) -> int:
         # TODO Day 3.
         # Hint: q.insert_payment_attempt(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.add")
+        with self.db.transaction() as conn:
+            return q.insert_payment_attempt(
+                conn,
+                invoice_id,
+                attempt_no,
+                status,
+                failure_reason,
+                next_retry_at.isoformat() if next_retry_at else None,
+            )
 
     def list_for_invoice(self, invoice_id: int) -> list[dict]:
         # TODO Day 3.
         # Hint: q.select_attempts_for_invoice(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.list_for_invoice")
+        with self.db.connect() as conn:
+            rows = q.select_attempts_for_invoice(conn, invoice_id)
+        return [dict(row) for row in rows]
 
     def count_for_invoice(self, invoice_id: int) -> int:
         # TODO Day 3.
         # Hint: q.count_attempts_for_invoice(...)
-        raise NotImplementedError("Day 3: implement PaymentAttemptRepository.count_for_invoice")
+        with self.db.connect() as conn:
+            return q.count_attempts_for_invoice(conn, invoice_id)
+
